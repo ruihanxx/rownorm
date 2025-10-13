@@ -1,0 +1,35 @@
+# IMDB Transformer Classification Configuration
+model: transformer_small
+dataset: imdb
+
+# Model parameters
+vocab_size: 10000
+max_length: 512
+num_classes: 2
+
+# Training parameters
+batch_size: 32
+epochs: 20
+learning_rate: 0.001
+
+# Optimizer settings (will be overridden by command line)
+optimizer: adamw
+weight_decay: 0.01
+
+# Scheduler
+scheduler: cosine
+warmup_epochs: 2
+min_lr: 0.0
+
+# Regularization
+dropout: 0.1
+clip: 1.0
+
+# Hardware
+amp: true
+num_workers: 4
+
+# Logging
+print_freq: 100
+save_freq: 5
+
