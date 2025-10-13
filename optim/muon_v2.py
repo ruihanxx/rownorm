@@ -32,21 +32,27 @@ def zeropower_via_newtonschulz5(G, steps: int):
     return X
 
 
-def muon_update(grad, momentum, beta=0.95, ns_steps=5, nesterov=True):
-    momentum.lerp_(grad, 1 - beta)
-    update = grad.lerp_(momentum, beta) if nesterov else momentum
+def muon_update(grad, buf,momentum=0.9, nesterov=0.9, ns_steps=5):
+    if momentum > 0:
+        if nesterov > 0:
+            update = grad.lerp(buf, nesterov)  
+            buf.lerp_(grad, 1 - momentum)
+        else:
+            buf.lerp_(grad, 1 - momentum)
+            update = momentum
+    else:
+        update = grad
     if update.ndim == 4:  # for the case of conv filters
         update = update.view(len(update), -1)
     update = zeropower_via_newtonschulz5(update, steps=ns_steps)
     update *= max(1, grad.size(-2) / grad.size(-1))**0.5
     return update
 
-
 class MuonV2(torch.optim.Optimizer):
     """
     MuonV2 optimizer implementing the modified update rule:
     d <- alpha * nabla f(x) + (1-alpha) * d
-    x <- (1-gamma) * x + lr * normalize(d)
+    x <- (1-lr*weight_decay) * x + lr * normalize(d)
 
     This version uses the same Newton-Schulz orthogonalization as Muon_wrap
     but with a modified parameter update rule that includes weight decay.
@@ -65,25 +71,24 @@ class MuonV2(torch.optim.Optimizer):
         self,
         params: Iterable[torch.nn.Parameter],
         lr: float = 0.05,
-        beta: float = 0.95,
-        gamma: float = 0.0,
+        momentum: float = 0.95,
         ns_steps: int = 5,
-        nesterov: bool = True,
+        nesterov: float = 0.0,
         weight_decay: float = 0.0,
     ) -> None:
         if lr <= 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
-        if not (0.0 <= beta <= 1.0):
-            raise ValueError(f"Invalid beta (should be in [0,1]): {beta}")
-        if gamma < 0.0:
-            raise ValueError(f"Invalid gamma (should be >= 0): {gamma}")
+        if not (0.0 <= momentum <= 1.0):
+            raise ValueError(f"Invalid momentum (should be in [0,1]): {momentum}")
+        if not (0.0 <= nesterov <= 1.0):
+            raise ValueError(f"Invalid nesterov (should be >= 0): {nesterov}")
         if ns_steps <= 0:
             raise ValueError(f"Invalid ns_steps: {ns_steps}")
         if weight_decay < 0.0:
             raise ValueError(f"Invalid weight_decay: {weight_decay}")
 
-        defaults = dict(lr=lr, beta=beta, gamma=gamma,
-                        ns_steps=ns_steps, nesterov=nesterov, weight_decay=weight_decay)
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov,
+                        ns_steps=ns_steps, weight_decay=weight_decay)
         super().__init__(params, defaults)
 
     @torch.no_grad()
@@ -95,10 +100,9 @@ class MuonV2(torch.optim.Optimizer):
 
         for group in self.param_groups:
             lr: float = group["lr"]
-            beta: float = group["beta"]
-            gamma: float = group["gamma"]
+            momentum: float = group["momentum"]
             ns_steps: int = group["ns_steps"]
-            nesterov: bool = group["nesterov"]
+            nesterov: float = group["nesterov"]
             weight_decay: float = group["weight_decay"]
 
             for p in group["params"]:
@@ -116,19 +120,27 @@ class MuonV2(torch.optim.Optimizer):
                 # Use Muon update with Newton-Schulz orthogonalization for 2D+ tensors
                 if grad.ndim >= 2:
                     update = muon_update(grad, state["momentum_buffer"], 
-                                       beta=beta, ns_steps=ns_steps, nesterov=nesterov)
+                                       momentum=momentum, ns_steps=ns_steps, nesterov=nesterov)
                 else:
                     # For 1D parameters (like bias), use standard momentum without orthogonalization
                     momentum_buffer = state["momentum_buffer"]
-                    momentum_buffer.lerp_(grad, 1 - beta)
-                    update = grad.lerp_(momentum_buffer, beta) if nesterov else momentum_buffer
+                    if momentum > 0:
+                        if nesterov > 0:
+                            update = grad.lerp(momentum_buffer, nesterov)  
+                            momentum_buffer.lerp_(grad, 1 - momentum)
+                        else:
+                            momentum_buffer.lerp_(grad, 1 - momentum)
+                            update = momentum_buffer
+                    else:
+                        update = grad
+                    
 
                 # Apply weight decay first (decoupled)
                 if weight_decay != 0.0:
                     p.mul_(1.0 - lr * weight_decay)
 
-                # Modified update rule: x <- (1-gamma) * x + lr * normalize(d)
+                # Modified update rule: x <- (1-lr*weight_decay) * x + lr * normalize(d)
                 # This combines parameter shrink with the normalized step
-                p.mul_(1.0 - gamma).add_(update.reshape(p.shape), alpha=-lr)
+                p.add_(update.reshape(p.shape), alpha=-lr)
 
         return loss
