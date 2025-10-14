@@ -194,16 +194,39 @@ class RowNormSGD(torch.optim.Optimizer):
                 
                 # Row-wise L2 normalization for 2D/4D params
                 if d_p.ndim in (2, 4):
-                    self._rownorm_inplace(d_p, eps, p_exp, q_exp)
-
+                    # print(torch.count_nonzero(d_p),'1')
+                    if p_exp < 99999:
+                        
+                        self._rownorm_inplace(d_p, eps, p_exp, q_exp)
+                    else:
+                        if d_p.ndim == 4:
+                            G = d_p.reshape(d_p.shape[0], -1)
+                            m, n = G.shape
+                            _, jstar = (G.abs()).max(dim=1) 
+                            X = torch.zeros_like(G)
+                            rows = torch.arange(m, device=G.device)
+                            X[rows, jstar] = G[rows, jstar].sign()
+                            d_p = X.reshape_as(d_p)
+                        else:
+                            G = d_p
+                            m, n = G.shape
+                            _, jstar = (G.abs()).max(dim=1) 
+                            X = torch.zeros_like(G)
+                            rows = torch.arange(m, device=G.device)
+                            X[rows, jstar] = G[rows, jstar].sign()
+                            d_p = X
+                        
+                    # print(torch.count_nonzero(d_p))
+                elif d_p.ndim == 1:
+                    d_p = torch.sign(d_p)
+                
                 # Decoupled weight decay
                 if weight_decay != 0:
                     p.mul_(1.0 - lr * weight_decay)
 
                 alpha = -lr
-                if use_fan_scaling and p.ndim != 1:
+                if use_fan_scaling and p.ndim != 1 and p_exp < 99999:
                     fin, fout = self._fans_by_rule(p)
-                    # p_exp > 1 guaranteed in __init__
                     
                     # scale = fan_out^{1/q} / fan_in^{1/p}
                     scale = (float(fout) ** (1.0 / q_exp)) / (float(fin) ** (1.0 / p_exp))
