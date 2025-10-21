@@ -4,6 +4,70 @@ from typing import Iterable, List, Optional
 import torch
 
 
+
+def topk_argmax_1to1(G: torch.Tensor, k: int = 1) -> torch.Tensor:
+    """
+    给定矩阵 G (m x n)，按列选取 |G| 最大的 k 个行索引 i_j，
+    输出同形状矩阵 X，满足：
+        X_{i_j, j} = (1/k) * sign(G_{i_j, j}), 其余元素为 0。
+    说明：
+    - 纯向量化，无 Python 循环，GPU/CPU 通用（随 G 的 device）。
+    - 若 k > m，将自动截断为 m；k 必须 >= 1。
+    """
+    if G.dim() != 2:
+        raise ValueError("G 必须是二维矩阵 (m x n)")
+    if k < 1:
+        raise ValueError("k 必须是正整数")
+
+    m, n = G.shape
+    k = min(k, m)
+
+    # 取每一列按 |G| 的 top-k 的行索引 (形状: k x n)
+    idx = torch.topk(G.abs(), k=k, dim=0, largest=True, sorted=False).indices
+
+    # 对应位置的符号 (形状: k x n)
+    signs = torch.sign(G).gather(dim=0, index=idx)
+
+    # 赋值矩阵：选中的位置为 sign/k
+    X = torch.zeros_like(G)
+    X.scatter_(0, idx, signs / float(k))
+    return X
+
+def zeropower_via_newtonschulz5(G, steps: int):
+    """
+    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
+    quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
+    of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
+    zero even beyond the point where the iteration no longer converges all the way to one everywhere
+    on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
+    where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
+    performance at all relative to UV^T, where USV^T = G is the SVD.
+    """
+    try:
+        G.dim
+    except AttributeError:
+
+        G = np.asarray(G)
+    
+    assert G.ndim >= 2  
+    a, b, c = (3.4445, -4.7750,  2.0315)
+    X = G.bfloat16()
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+
+    # Ensure spectral norm is at most 1
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    # Perform the NS iterations
+    for _ in range(steps):
+        A = X @ X.mT
+        # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    return X
+
 class RowNormSGD(torch.optim.Optimizer):
     """
     Row normalization is performed as:
@@ -24,7 +88,7 @@ class RowNormSGD(torch.optim.Optimizer):
         nesterov_mom: float = 0.0,
         eps: float = 1e-8,
         max_grad_norm: float = 1.0,
-        p_exp: float = 2.0,  
+        p_exp: float = 1.0,  
         q_exp: float = torch.inf,          
         use_fan_scaling: bool = True,    
     ) -> None:
@@ -36,7 +100,7 @@ class RowNormSGD(torch.optim.Optimizer):
             raise ValueError("Nesterov momentum requires a momentum > 0")
         if eps <= 0.0:
             raise ValueError(f"Invalid eps: {eps}")
-        if max_grad_norm <= 0.0:
+        if max_grad_norm < 0.0:
             raise ValueError(f"Invalid max_grad_norm: {max_grad_norm}")
         if p_exp < 1.0:                    
             raise ValueError("p must be >= 1")
@@ -56,7 +120,8 @@ class RowNormSGD(torch.optim.Optimizer):
         if t.ndim == 2:
             fin = t.size(1)
             fout = t.size(0)
-            if isinstance(fin_override, int):  fin = fin_override
+            if isinstance(fin_override, int):  
+                fin = fin_override
             if isinstance(fout_override, int): fout = fout_override
             return int(fin), int(fout)
 
@@ -75,7 +140,7 @@ class RowNormSGD(torch.optim.Optimizer):
             "Use 2D/4D or disable fan scaling."
         )
     @staticmethod
-    def _rownorm_inplace(grad: torch.Tensor, eps: float, p_exp: float=2, q_exp: float = torch.inf) -> torch.Tensor:
+    def _rownorm_inplace(grad: torch.Tensor, eps: float, p_exp: float=1, q_exp: float = torch.inf) -> torch.Tensor:
         """Row-normalize gradient for 2D or 4D tensors. Returns the normalized grad view.
 
         - If grad.ndim == 2: normalize rows.
@@ -87,28 +152,30 @@ class RowNormSGD(torch.optim.Optimizer):
         if grad is None:
             return grad
         if grad.ndim == 2:
+            
             g2d = grad
             g2d_float = g2d.float()
+            # print(g2d.shape)
             if q_exp > 999999999:
                 norms = g2d_float.norm(p=p_exp, dim=1, keepdim=True).pow_(p_exp-1)
                 # Use more stable normalization with adaptive epsilon
                 adaptive_eps = eps * torch.ones_like(norms)
-                adaptive_eps = torch.max(adaptive_eps, norms * 1e-6)  # Scale eps with norm magnitude
+                adaptive_eps = torch.max(adaptive_eps, norms * 1e-8)  # Scale eps with norm magnitude
                 norms = norms.clamp_min(adaptive_eps)
                 g2d_float = g2d_float.abs().pow(p_exp-1) * g2d_float.sign()
                 normalized = (g2d_float / norms).to(grad.dtype)
-                g2d.copy_(normalized)
+                grad.copy_(normalized)
                 return grad
             elif p_exp == 1:
                 q_exp_star = 1/(1-1/q_exp)
                 norms = g2d_float.norm(p=q_exp_star, dim=0, keepdim=True).pow_(q_exp_star-1)
                 # Use more stable normalization with adaptive epsilon
                 adaptive_eps = eps * torch.ones_like(norms)
-                adaptive_eps = torch.max(adaptive_eps, norms * 1e-6)  # Scale eps with norm magnitude
+                adaptive_eps = torch.max(adaptive_eps, norms * 1e-8)  # Scale eps with norm magnitude
                 norms = norms.clamp_min(adaptive_eps)
                 g2d_float = g2d_float.abs().pow(q_exp_star-1) * g2d_float.sign()
                 normalized = (g2d_float / norms).to(grad.dtype)
-                g2d.copy_(normalized)
+                grad.copy_(normalized)
                 return grad
         if grad.ndim == 4:
             
@@ -118,7 +185,7 @@ class RowNormSGD(torch.optim.Optimizer):
                 norms = g2d_float.norm(p=p_exp, dim=1, keepdim=True).pow_(p_exp-1)
                 # Use more stable normalization with adaptive epsilon
                 adaptive_eps = eps * torch.ones_like(norms)
-                adaptive_eps = torch.max(adaptive_eps, norms * 1e-6)  # Scale eps with norm magnitude
+                adaptive_eps = torch.max(adaptive_eps, norms * 1e-8)  # Scale eps with norm magnitude
                 norms = norms.clamp_min(adaptive_eps)
                 g2d_float = g2d_float.abs().pow(p_exp-1) * g2d_float.sign() / norms
                 normalized = g2d_float.reshape_as(grad).to(grad.dtype)
@@ -131,7 +198,7 @@ class RowNormSGD(torch.optim.Optimizer):
                 norms = g2d_float.norm(p=q_exp_star, dim=0, keepdim=True).pow_(q_exp_star-1)
                 # Use more stable normalization with adaptive epsilon
                 adaptive_eps = eps * torch.ones_like(norms)
-                adaptive_eps = torch.max(adaptive_eps, norms * 1e-6)  # Scale eps with norm magnitude
+                adaptive_eps = torch.max(adaptive_eps, norms * 1e-8)  # Scale eps with norm magnitude
                 norms = norms.clamp_min(adaptive_eps)
                 g2d_float = g2d_float.abs().pow(q_exp_star-1) * g2d_float.sign() / norms
                 normalized = g2d_float.reshape_as(grad).to(grad.dtype)
@@ -163,12 +230,12 @@ class RowNormSGD(torch.optim.Optimizer):
                     gradients.append(p.grad)
             
             # Global gradient clipping before row normalization
-            if gradients and max_grad_norm > 0:
-                total_norm = torch.norm(torch.stack([torch.norm(g.detach()) for g in gradients]))
-                clip_coef = max_grad_norm / (total_norm + 1e-6)
-                if clip_coef < 1:
-                    for g in gradients:
-                        g.mul_(clip_coef)
+            # if gradients and max_grad_norm > 0:
+            #     total_norm = torch.norm(torch.stack([torch.norm(g.detach()) for g in gradients]))
+            #     clip_coef = max_grad_norm / (total_norm + 1e-6)
+            #     if clip_coef < 1:
+            #         for g in gradients:
+            #             g.mul_(clip_coef)
 
             for p in group["params"]:
                 if p.grad is None:
@@ -192,45 +259,88 @@ class RowNormSGD(torch.optim.Optimizer):
                 else:
                     d_p = grad
                 
-                # Row-wise L2 normalization for 2D/4D params
-                if d_p.ndim in (2, 4):
-                    # print(torch.count_nonzero(d_p),'1')
+                # # Row-wise L2 normalization for 2D/4D params
+                if d_p.ndim == 2:
                     if p_exp < 99999:
-                        
-                        self._rownorm_inplace(d_p, eps, p_exp, q_exp)
-                    else:
-                        if d_p.ndim == 4:
-                            G = d_p.reshape(d_p.shape[0], -1)
-                            m, n = G.shape
-                            _, jstar = (G.abs()).max(dim=1) 
-                            X = torch.zeros_like(G)
-                            rows = torch.arange(m, device=G.device)
-                            X[rows, jstar] = G[rows, jstar].sign()
-                            d_p = X.reshape_as(d_p)
+                        p_is_ebd = getattr(p, "is_ebd", 0)
+                        p_is_conv = getattr(p, "is_conv", 0)
+                        if p_is_conv:
+                            p_is_qkv = getattr(p, "is_qkv", 0)
+                            if not p_is_qkv:
+                                fin, fout = self._fans_by_rule(p)
+                                d_p = self._rownorm_inplace(d_p.T, eps, p_exp, q_exp).T
+                                
+                                d_p.mul_(1/(float(fin) ** (1.0 / p_exp)))
+
+                                # d_p = torch.sign(d_p).mul(1/(float(fin)))
+                            elif (not p_is_ebd) and p_is_qkv:
+                                fin, fout = self._fans_by_rule(p)
+                                gq, gk, gv = torch.chunk(d_p, 3, dim=1)
+                                gq2 = self._rownorm_inplace(gq.T, eps, p_exp, q_exp).T
+                                gk2 = self._rownorm_inplace(gk.T, eps, p_exp, q_exp).T
+                                gv2 = self._rownorm_inplace(gv.T, eps, p_exp, q_exp).T
+                                
+                                d_p = torch.cat([gq2, gk2, gv2], dim=1)
+                                
+                                d_p.mul_(1/(float(fin) ** (1.0 / p_exp)))
+                                # d_p = torch.sign(d_p).mul(1/(float(fin)))
+                        elif p_is_ebd:
+                            fin, fout = self._fans_by_rule(p)
+                            # d_p = zeropower_via_newtonschulz5(d_p, 5)
+                            
+                            # d_p.mul_(fout**0.5)
+                            d_p = torch.sign(d_p)
+                            # d_p = self._rownorm_inplace(d_p, eps, p_exp, q_exp)
+                            
+
+                            # d_p = self._rownorm_inplace(d_p.T, eps, p_exp, q_exp).T
+                            # d_p.mul_(1/(float(fin))** (1.0 / p_exp))
+                            # d_p.mul_(fin**0.5)
+                            
+                            # d_p
                         else:
-                            G = d_p
-                            m, n = G.shape
-                            _, jstar = (G.abs()).max(dim=1) 
-                            X = torch.zeros_like(G)
-                            rows = torch.arange(m, device=G.device)
-                            X[rows, jstar] = G[rows, jstar].sign()
-                            d_p = X
-                        
+                            fin, fout = self._fans_by_rule(p)
+                            d_p = self._rownorm_inplace(d_p, eps, p_exp, q_exp)
+                            d_p.mul_(1/(float(fin) ** (1.0 / p_exp)))
+                            # d_p = torch.sign(d_p)
+                            # d_p = torch.sign(d_p).mul(1/(float(fin))** (1.0 / p_exp))
+                            
+                            # update = topk_argmax_1to1(d_p, 100)
+                            # d_p = update.mul(float(fout)/(float(fin)))
+                    # d_p = self._rownorm_inplace(d_p, eps, p_exp, q_exp)
                     # print(torch.count_nonzero(d_p))
                 elif d_p.ndim == 1:
                     d_p = torch.sign(d_p)
+                    
                 
                 # Decoupled weight decay
-                if weight_decay != 0:
-                    p.mul_(1.0 - lr * weight_decay)
+                if weight_decay != 0 :
+                    
+                    if p.ndim != 1:
+                        p.mul_(1.0 - lr * weight_decay)
 
                 alpha = -lr
-                if use_fan_scaling and p.ndim != 1 and p_exp < 99999:
-                    fin, fout = self._fans_by_rule(p)
-                    
-                    # scale = fan_out^{1/q} / fan_in^{1/p}
-                    scale = (float(fout) ** (1.0 / q_exp)) / (float(fin) ** (1.0 / p_exp))
-                    alpha *= scale
+                
+                # if use_fan_scaling and p_exp < 99999:
+                #     if p.ndim != 1:
+                #         fin, fout = self._fans_by_rule(p)
+                #         # fout, fin = self._fans_by_rule(p)
+                #         # print(fin,fout)
+                #         # scale = fan_out^{1/q} / fan_in^{1/p}
+                        
+                #         scale = (float(fout) ** (1.0 / q_exp)) / (float(fin) ** (1.0 / p_exp))
+                #         # print(alpha,scale)
+                #         alpha *= scale
+                #     # elif False:
+                #     #     p_is_ln = getattr(p, "is_ln", 0)
+                #     #     if p_is_ln:
+                #     #         fin = len(p)
+                #     #         fout = len(p)
+                #     #         scale = (float(fout) ** (1.0 / q_exp)) / (float(fin) ** (1.0 / p_exp))
+                            
+                #     #         # alpha *= scale
+                #     #         alpha *= 10
+
 
                 p.add_(d_p, alpha=alpha)
 
