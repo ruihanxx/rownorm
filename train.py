@@ -1,672 +1,530 @@
-import argparse
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
 import os
-import csv
-import json
-import random
-from pathlib import Path
-from datetime import datetime
+import time
 import math
-import torch
+import csv
+import argparse
+from contextlib import nullcontext
+
 import numpy as np
+import torch
+import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.nn as nn
-import torch.optim as optim
 from torch.cuda.amp import GradScaler, autocast
 from torch.nn.utils import clip_grad_norm_
+import torch.distributed as dist
+from ddp_utils import init_distributed, is_main_process, get_rank, get_world_size, reduce_sum, reduce_mean, barrier
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
 
-# Optional plotting
-try:
-    import matplotlib
-    matplotlib.use('Agg')  # headless
-    import matplotlib.pyplot as plt
-    _MATPLOTLIB_OK = True
-except Exception:
-    _MATPLOTLIB_OK = False
-
-from models.resnet_cifar import resnet18_cifar
+from utils.logging import SmoothedValue, Timer
 from utils.common import get_cifar10_dataloaders
 from utils.metrics import accuracy
 from utils.logging import SmoothedValue, Timer
 from optim.rownorm import RowNormSGD
 from optim.signsgd import SignSGD
-from optim.muon_wrap import build_single_device_muon_with_aux_adam
-from optim.normmomentum import NormMomentum
-from optim.muon_v2 import MuonV2
-from optim.sgd_variant import SGDVariant
-from optim.adamw_rescale import AdamWScale
 
+
+from optim.muon_v2 import MuonV2
+
+from optim.adamw_rescale import AdamWScale
+from optim.rowmix import RowmixSGD
+import os, math, csv, datetime
+from typing import Optional, Dict, Any, Iterable
+try:
+    from transformers.models.gpt2.modeling_gpt2 import Conv1D as HFConv1D
+except Exception:
+    HFConv1D = None
+try:
+    from transformers.pytorch_utils import Conv1D as HFConv1D_Alt
+    if HFConv1D is None:
+        HFConv1D = HFConv1D_Alt
+except Exception:
+    pass
+
+
+# Import model module
+from models.gpt2_model import load_tokenizer, build_model_from_name, build_gpt2, init_model_params_rowlmo, init_model_params_rowlmo_rowmix
+from set_fans import set_fans_gpt2
 
 def build_weight_decay_param_groups(model: nn.Module, weight_decay: float):
-    """
-    Apply weight decay to weight matrices (ndim>=2). Disable decay for biases/BN.
-    """
-    decay_params = []
-    no_decay_params = []
+    decay_params, no_decay_params = [], []
     for p in model.parameters():
         if not p.requires_grad:
             continue
-        if p.ndim >= 2:
-            decay_params.append(p)
-        else:
-            no_decay_params.append(p)
+        (decay_params if p.ndim >= 2 else no_decay_params).append(p)
     return [
         {"params": decay_params, "weight_decay": weight_decay},
         {"params": no_decay_params, "weight_decay": 0.0},
     ]
 
-def linear_decay_scheduler(optimizer, total_epochs, warmup_epochs=0, min_lr=0.0):
-    total = max(1, int(total_epochs))
-    warm = max(0, int(warmup_epochs))
-
-    if total <= warm and warm > 0:
-        # 只有 warmup
-        return torch.optim.lr_scheduler.LinearLR(
-            optimizer,
-            start_factor=(1.0 / float(max(1, warm))),
-            end_factor=1.0,
-            total_iters=warm
-        )
-
-    schedulers = []
-    milestones = []
-
-    if warm > 0:
-        warmup = torch.optim.lr_scheduler.LinearLR(
-            optimizer,
-            start_factor=(1.0 / float(max(1, warm))),
-            end_factor=1.0,
-            total_iters=warm
-        )
-        schedulers.append(warmup)
-        milestones.append(warm)
-
-    decay_epochs = max(1, total - warm)
-
-    # 为每个 param group 精确算出从 base_lr 线性到 min_lr 的倍率函数
-    base_lrs = [pg['lr'] for pg in optimizer.param_groups]
-    min_factors = [float(min_lr) / float(b) for b in base_lrs]
-
-    def make_linear_fn(factor_min):
-        # epoch 从 0 到 decay_epochs
-        def fn(epoch):
-            t = float(epoch) / float(max(1, decay_epochs))
-            # 线性插值：1 -> factor_min
-            return (1.0 - t) * 1.0 + t * factor_min
-        return fn
-
-    lambdas = [make_linear_fn(fm) for fm in min_factors]
-    linear = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambdas)
-    schedulers.append(linear)
-
-    if warm > 0:
-        from torch.optim.lr_scheduler import SequentialLR
-        return SequentialLR(optimizer, schedulers=schedulers, milestones=milestones)
-    else:
-        return linear
-
-def two_stage_linear_scheduler(optimizer, total_epochs, warmup_epochs=0, min_lr=0.0, k=1.0):
-
-    assert k > 0 
-    total = max(1, int(total_epochs))
-    warm = max(0, int(warmup_epochs))
-
-    # 只有 warmup
-    if total <= warm and warm > 0:
-        return torch.optim.lr_scheduler.LinearLR(
-            optimizer,
-            start_factor=(1.0 / float(max(1, warm))),
-            end_factor=1.0,
-            total_iters=warm
-        )
-
-    schedulers, milestones = [], []
-
-    # warmup（可选）
-    if warm > 0:
-        warmup = torch.optim.lr_scheduler.LinearLR(
-            optimizer,
-            start_factor=(1.0 / float(max(1, warm))),
-            end_factor=1.0,
-            total_iters=warm
-        )
-        schedulers.append(warmup)
-        milestones.append(warm)
-
-    # 两段式线性衰减
-    T = max(1, total - warm)             # 衰减总长度（epoch 数）
-    T1 = T // 2                          # 前半段时长
-    T2 = T - T1                          # 后半段时长（保证 T1+T2=T，奇数时后半多 1）
-
-    base_lrs = [pg['lr'] for pg in optimizer.param_groups]
-    # 目标末端倍率（<=1），允许 min_lr=0
-    fmins = [float(min_lr) / float(b) if b > 0 else 0.0 for b in base_lrs]
-    # 每个 group 的总下降量 D = 1 - fmin
-    Ds = [max(0.0, 1.0 - fmin) for fmin in fmins]
-
-    # 斜率约束： (d1/T1) = k * (d2/T2)，且 d1 + d2 = D
-    # => d2 = D / (1 + k*T1/T2)；d1 = D - d2
-    # 需要考虑 T1 或 T2 可能为 0 的边界（当 T=1 时）
-    def split_d(D, T1, T2, k):
-        if T1 == 0:      # 全在后半段
-            return 0.0, D
-        if T2 == 0:      # 全在前半段
-            return D, 0.0
-        d2 = D / (1.0 + k * (float(T1) / float(T2)))
-        d1 = D - d2
-        return d1, d2
-
-    d_pairs = [split_d(D, T1, T2, k) for D in Ds]
-
-    def make_piecewise_fn(d1, d2, T1, T2):
-        # 分段线性：factor(0)=1，前半降 d1，后半再降 d2，末端 1-(d1+d2)=fmin
-        s1 = (d1 / max(1, T1)) if T1 > 0 else 0.0  # 前半每个 epoch 下跌量
-        s2 = (d2 / max(1, T2)) if T2 > 0 else 0.0  # 后半每个 epoch 下跌量
-        def fn(epoch):  # epoch: 0..T-1
-            if T1 > 0 and epoch < T1:
-                return 1.0 - s1 * float(epoch)
-            # 第二段：从 1-d1 继续降
-            e2 = float(epoch - T1)
-            return 1.0 - d1 - s2 * max(0.0, e2)
-        return fn
-
-    lambdas = [make_piecewise_fn(d1, d2, T1, T2) for (d1, d2) in d_pairs]
-    decay = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambdas)
-    schedulers.append(decay)
-
-    if warm > 0:
-        from torch.optim.lr_scheduler import SequentialLR
-        return SequentialLR(optimizer, schedulers=schedulers, milestones=milestones)
-    else:
-        return decay
-
-def get_optimizer(model, name: str, lr: float, weight_decay: float, momentum: float, nesterov_mom: float, alpha: float = 0.1, gamma: float = 0.0, scale_type: str = "none", norm_pq=(2,torch.inf)):
-    name = name.lower()
-    if name == "muon":
-        return build_single_device_muon_with_aux_adam(model, muon_lr=lr, muon_weight_decay=weight_decay, muon_momentum=momentum)
-
+def get_optimizer(model, name: str, lr: float, weight_decay: float, momentum: float, nesterov_mom: float, norm_pq=(1,torch.inf), use_fan_scaling=True):
+    import torch.optim as optim
     param_groups = build_weight_decay_param_groups(model, weight_decay)
-    if name == "sgd":
-        return optim.SGD(param_groups, lr=lr, momentum=momentum, nesterov=nesterov_mom)
+    name = name.lower()
+    if name == 'rowmix':
+        return RowmixSGD(param_groups, lr=lr, momentum=momentum, weight_decay=weight_decay, nesterov_mom=nesterov_mom, max_grad_norm=1)
     if name == "rownorm":
-        return RowNormSGD(param_groups, lr=lr, momentum=momentum, weight_decay=weight_decay, nesterov_mom=nesterov_mom, max_grad_norm=1.0, p_exp=norm_pq[0], q_exp = norm_pq[1])
+        return RowNormSGD(param_groups, lr=lr, momentum=momentum, weight_decay=weight_decay, nesterov_mom=nesterov_mom, max_grad_norm=1.0, p_exp=norm_pq[0], q_exp = norm_pq[1], use_fan_scaling = use_fan_scaling)
     if name == "signsgd":
-        return SignSGD(param_groups, lr=lr, momentum=momentum, weight_decay=weight_decay)
+        return SignSGD(param_groups, lr=lr, momentum=momentum, weight_decay=weight_decay, p_exp = 1, use_fan_scaling = use_fan_scaling)
     if name == "adamw":
-        return optim.AdamW(param_groups, lr=lr)
-    if name == "normmom":
-        return NormMomentum(param_groups, lr=lr, alpha=alpha, gamma=gamma)
+        if nesterov_mom > 0:
+            print('using NADAMW')
+            return optim.NAdam(param_groups, lr=lr, weight_decay = weight_decay, decoupled_weight_decay=True, betas=(0.9, 0.95))
+        else:
+            print('using ADAMW')
+            return optim.AdamW(param_groups, lr=lr, weight_decay = weight_decay, betas=(0.9, 0.95))
     if name == "muonv2":
         return MuonV2(param_groups, lr=lr, momentum=momentum, weight_decay=weight_decay, nesterov=nesterov_mom)
     if name == "sgdvariant":
         return SGDVariant(param_groups, lr=lr, momentum=momentum, weight_decay=0.0)
     if name == "adamw_rescale":
-        return AdamWScale(param_groups, lr=lr, betas=(momentum, 1-(1-momentum)**2), weight_decay=weight_decay, p_exp=norm_pq[0], q_exp = norm_pq[1])
+        return AdamWScale(param_groups, lr=lr, betas=(momentum, 1-(1-momentum)*2), weight_decay=weight_decay, p_exp=1, q_exp = norm_pq[1])
     raise ValueError(f"Unknown optimizer: {name}")
+    raise ValueError(f"Unknown optimizer {name}")
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="nanoGPT-style GPT-2 training loop with DDP + cosine LR decay, "
+                    "using custom build_gpt2 / get_optimizer, and logging to CSV."
+    )
+
+    # I/O
+    parser.add_argument("--out_dir", type=str, default="out",
+                        help="Directory to save checkpoints.")
+    parser.add_argument("--dataset_dir", type=str, default="data/openwebtext-bin",
+                        help="Path to folder containing train.bin and val.bin (relative to this script or absolute).")
+    parser.add_argument("--log_every", type=int, default=1,
+                        help="How often (in iterations) to print training loss.")
+    parser.add_argument("--eval_interval", type=int, default=2000,
+                        help="How often (in iterations) to run evaluation + checkpoint + CSV log.")
+    parser.add_argument("--eval_iters", type=int, default=200,
+                        help="Number of batches per split for evaluation.")
+    parser.add_argument("--max_iters", type=int, default=600000,
+                        help="Total number of optimizer steps (iterations).")
+
+    # Data / model size
+    parser.add_argument("--batch_size", type=int, default=12,
+                        help="Micro-batch size per process (per GPU).")
+    parser.add_argument("--block_size", type=int, default=1024,
+                        help="Sequence length / context length.")
+    parser.add_argument("--model_name", type=str, default="small",
+                        help="Name passed as gpt2name to build_gpt2 (e.g. gpt2, gpt2-medium).")
+
+    # Gradient accumulation (global, across all GPUs)
+    parser.add_argument("--grad_accum_steps", type=int, default=40,
+                        help="Global gradient accumulation steps across all GPUs (like nanoGPT's gradient_accumulation_steps).")
+
+    # Optimizer / LR
+    parser.add_argument("--opt", type=str, default="adamw",
+                        help="Optimizer name passed to get_optimizer.")
+    parser.add_argument("--lr", type=float, default=6e-4,
+                        help="Peak learning rate.")
+    parser.add_argument("--min_lr", type=float, default=6e-5,
+                        help="Minimum learning rate after cosine decay.")
+    parser.add_argument("--warmup_iters", type=int, default=2000,
+                        help="Iterations for linear LR warmup.")
+    parser.add_argument("--lr_decay_iters", type=int, default=600000,
+                        help="Iterations over which to decay LR with cosine (usually ~= max_iters).")
+    parser.add_argument("--weight_decay", type=float, default=1e-1,
+                        help="Weight decay passed to get_optimizer.")
+    parser.add_argument("--momentum", type=float, default=0.9,
+                        help="Momentum passed to get_optimizer (if optimizer uses it).")
+    parser.add_argument("--nesterov_mom",type=float, default=0)
+    
+    parser.add_argument('--use_fan_scaling', type=float, default=0)
+    parser.add_argument("--grad_clip", type=float, default=1.0,
+                        help="Max gradient norm for clipping (<=0 disables clipping).")
+
+    # System / DDP / precision
+    parser.add_argument("--device", type=str, default="cuda",
+                        help="Device when not using torchrun (cpu, cuda, cuda:0, mps, or auto).")
+    parser.add_argument("--dtype", type=str, default="auto",
+                        choices=["auto", "float32", "bfloat16", "float16"],
+                        help="Training dtype; auto picks bfloat16 if available else float32.")
+    parser.add_argument("--compile", action="store_true",
+                        help="Use torch.compile to optimize the model (PyTorch 2.0+).")
+    parser.add_argument("--backend", type=str, default="nccl",
+                        help="DDP backend (nccl, gloo, etc.).")
+    parser.add_argument("--seed", type=int, default=1337,
+                        help="Base random seed (will be offset by rank in DDP).")
+    parser.add_argument('--p_exp', type=float,
+                        default=1)
+    parser.add_argument('--q_exp', type=int,
+                        default=torch.inf)
+    args = parser.parse_args()                    
+    args.normpq = [args.p_exp,args.q_exp] 
+    return args
 
 
-def train_one_epoch(model, loader, optimizer, device, scaler: GradScaler, max_grad_norm: float = 1.0, amp_enabled: bool = True):
-    model.train()
-    ce = nn.CrossEntropyLoss()
-    loss_meter = SmoothedValue()
-    top1_meter = SmoothedValue()
-    timer = Timer()
-    for images, targets in loader:
-        images = images.to(device, non_blocking=True)
-        targets = targets.to(device, non_blocking=True)
+def setup_ddp(args):
+    """
+    初始化分布式环境（如果是用 torchrun 启动的话）。
+    返回：device, ddp, rank, local_rank, world_size, master_process, seed_offset
+    """
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        # Launched by torchrun: multi-process multi-GPU
+        ddp = True
+        rank = int(os.environ["RANK"])
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        world_size = int(os.environ["WORLD_SIZE"])
 
-        optimizer.zero_grad(set_to_none=True)
-        with autocast(enabled=amp_enabled):
-            outputs = model(images)
-            loss = ce(outputs, targets)
-        scaler.scale(loss).backward()
-        if max_grad_norm is not None and max_grad_norm > 0:
-            scaler.unscale_(optimizer)
-            clip_grad_norm_(model.parameters(), max_grad_norm)
-        scaler.step(optimizer)
-        scaler.update()
+        if not torch.cuda.is_available():
+            raise RuntimeError("DDP with torchrun currently expects CUDA GPUs to be available.")
 
-        acc1, = accuracy(outputs, targets, topk=(1,))
-        loss_meter.update(loss.item(), images.size(0))
-        top1_meter.update(acc1.item(), images.size(0))
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
 
-    return loss_meter.avg, top1_meter.avg, timer.elapsed()
+        dist.init_process_group(backend=args.backend)
 
+        master_process = (rank == 0)
+        seed_offset = rank
+    else:
+        # Single-process (no torchrun)
+        ddp = False
+        rank = 0
+        local_rank = 0
+        world_size = 1
 
-@torch.no_grad()
-def evaluate(model, loader, device):
-    model.eval()
-    ce = nn.CrossEntropyLoss()
-    loss_meter = SmoothedValue()
-    top1_meter = SmoothedValue()
-    for images, targets in loader:
-        images = images.to(device, non_blocking=True)
-        targets = targets.to(device, non_blocking=True)
-        outputs = model(images)
-        loss = ce(outputs, targets)
-        acc1, = accuracy(outputs, targets, topk=(1,))
-        loss_meter.update(loss.item(), images.size(0))
-        top1_meter.update(acc1.item(), images.size(0))
-    return loss_meter.avg, top1_meter.avg
-# >>> 新增：枚举指定前缀（如 'layer2'）的参数
-def _iter_layer_params(model: nn.Module, prefix: str):
-    for name, p in model.named_parameters():
-        if name.startswith(prefix) and p.requires_grad:
-            yield name, p
+        if args.device == "auto":
+            if torch.cuda.is_available():
+                device = torch.device("cuda")
+            elif torch.backends.mps.is_available():
+                device = torch.device("mps")
+            else:
+                device = torch.device("cpu")
+        else:
+            device = torch.device(args.device)
 
-# >>> 新增：保存快照（权重 + 梯度）到 .pt，并可选写一行 CSV 统计
-def _save_layer_snapshot(model: nn.Module, epoch: int, out_dir: Path, run_name: str,
-                         layer_prefix: str, write_stats_csv: bool = False):
-    # 1) 打包张量
-    payload = {}
-    for name, p in _iter_layer_params(model, layer_prefix):
-        payload[name] = {
-            "weight": p.detach().cpu(),
-            "grad": (p.grad.detach().cpu() if (p.grad is not None) else None),
-            "shape": tuple(p.shape),
-            "dtype": str(p.dtype)
-        }
+        master_process = True
+        seed_offset = 0
 
-    # 2) 保存为 .pt（单个大文件，便于完整回放）
-    snap_dir = out_dir / f"{run_name}_layer_snapshots"
-    snap_dir.mkdir(parents=True, exist_ok=True)
-    snap_path = snap_dir / f"epoch{epoch:04d}_{layer_prefix.replace('.', '-')}.pt"
-    torch.save(payload, snap_path)
-
-    # 3) 可选：写一份轻量 CSV 统计
-    if write_stats_csv:
-        import csv, math
-        csv_path = snap_dir / f"{layer_prefix.replace('.', '-')}_stats.csv"
-        new_file = not csv_path.exists()
-        with open(csv_path, 'a', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=[
-                "epoch", "param_name", "shape",
-                "w_mean", "w_std", "w_l2", "w_absmax",
-                "g_mean", "g_std", "g_l2", "g_absmax", "has_grad"
-            ])
-            if new_file:
-                writer.writeheader()
-
-            for name, p in _iter_layer_params(model, layer_prefix):
-                w = p.detach()
-                w_mean = float(w.mean().item())
-                w_std  = float(w.std(unbiased=False).item())
-                w_l2   = float(w.norm(p=2).item())
-                w_absmax = float(w.abs().max().item())
-                if p.grad is not None:
-                    g = p.grad.detach()
-                    g_mean = float(g.mean().item())
-                    g_std  = float(g.std(unbiased=False).item())
-                    g_l2   = float(g.norm(p=2).item())
-                    g_absmax = float(g.abs().max().item())
-                    has_grad = True
-                else:
-                    g_mean = g_std = g_l2 = g_absmax = float('nan')
-                    has_grad = False
-
-                writer.writerow({
-                    "epoch": epoch,
-                    "param_name": name,
-                    "shape": str(tuple(p.shape)),
-                    "w_mean": w_mean, "w_std": w_std, "w_l2": w_l2, "w_absmax": w_absmax,
-                    "g_mean": g_mean, "g_std": g_std, "g_l2": g_l2, "g_absmax": g_absmax,
-                    "has_grad": has_grad
-                })
-
-    return snap_path
+    return device, ddp, rank, local_rank, world_size, master_process, seed_offset
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--data_dir', type=str,
-                        default=str(Path(__file__).resolve().parent/'data'/'cifar'))
-    parser.add_argument('--epochs', type=int, default=1)
-    parser.add_argument('--batch_size', type=int, default=128)
-    parser.add_argument('--lr', type=float, default=0.1)
-    parser.add_argument('--weight_decay', type=float, default=5e-4)
-    parser.add_argument('--opt', type=str, default='rownorm',
-                        choices=['sgd', 'rownorm', 'signsgd', 'muon', 'adamw', 'normmom', 'muonv2', 'sgdvariant', 'adamw_rescale'])
-    parser.add_argument('--clip', type=float, default=0.0)
-    parser.add_argument('--out_dir', type=str,
-                        default=str(Path(__file__).resolve().parent/'logs'))
-    parser.add_argument('--plot_dir', type=str,
-                        default=str(Path(__file__).resolve().parent/'plots'))
-    parser.add_argument('--run_name', type=str, default='')
-    parser.add_argument('--seed', type=int, default=1337)
-    parser.add_argument('--amp', dest='amp', action='store_true')
-    parser.add_argument('--no_amp', dest='amp', action='store_false')
-    parser.set_defaults(amp=True)
-    parser.add_argument('--momentum', type=float, default=0.9)
-    parser.add_argument('--nesterov_mom', type=float, default=0.0)
-    parser.add_argument('--sched', type=str, default='cosine',
-                        choices=['none', 'cosine', 'inverse', 'linear'])
-    parser.add_argument('--warmup_epochs', type=int, default=0)
-    parser.add_argument('--min_lr', type=float, default=0.0)
-    parser.add_argument('--alpha', type=float, default=0.1)
-    parser.add_argument('--gamma', type=float, default=0.0)
-    parser.add_argument('--num_workers', type=int, default=4)
-    parser.add_argument('--preset', type=str,
-                        default='none', choices=['none', 'auto'])
-    parser.add_argument('--model', type=str,
-                        default='resnet18_cifar', choices=['resnet18_cifar'])
-    parser.add_argument('--base_width', type=int, default=64)
-    parser.add_argument('--p_exp', type=int,
-                        default=2)
-    parser.add_argument('--q_exp', type=int,
-                        default=torch.inf)
-    parser.add_argument('--trials', type=int,
-                        default=1)
-    parser.add_argument('--lmo_init', type=int,
-                        default=0)
-    parser.add_argument('--layer_log', default=False)
-    parser.add_argument('--layer_log_prefix', type=str, default='layer2',
-                        help="Module name prefix to log (e.g., 'layer2', 'layer3.0.conv1').")
-    parser.add_argument('--layer_log_stats', action='store_true',
-                        help="Also append a CSV with summary stats per parameter (mean/std/norm, etc.).")
-    args = parser.parse_args()
-    args.normpq = [args.p_exp,args.q_exp]
-    device = 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu')
-    # Seeding for reproducibility
-    torch.manual_seed(args.seed)
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    if device == 'cuda':
-        torch.cuda.manual_seed_all(args.seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-    # Optional auto presets for more stable baselines
-    if args.preset == 'auto':
-        if args.opt == 'signsgd':
-            # Conservative, stable settings for vision
-            args.lr = 0.01 if args.lr == 0.1 else args.lr
-            args.momentum = 0.0
-            args.amp = False
-            args.clip = 0.0
-            args.weight_decay = 1e-4
-            if args.sched == 'cosine':
-                args.warmup_epochs = max(args.warmup_epochs, 3)
-        elif args.opt == 'rownorm':
-            args.lr = 0.05 if args.lr == 0.1 else args.lr
-            args.momentum = 0.9
-            args.nesterov_mom = 0.9
-            args.clip = 0.0
-            args.weight_decay = 5e-4
-            if args.sched == 'cosine':
-                args.warmup_epochs = max(args.warmup_epochs, 3)
-        elif args.opt == 'muon':
-            # Typical stable Muon settings
-            args.lr = 0.05 if args.lr == 0.1 else args.lr
-            args.momentum = 0.95
-            args.weight_decay = 0.0
-            args.amp = True
-            args.clip = 0.0
-            if args.sched == 'cosine':
-                args.warmup_epochs = max(args.warmup_epochs, 3)
-        elif args.opt == 'adamw':
-            args.lr = 3e-4 if args.lr == 0.1 else args.lr
-            args.weight_decay = 0.05 if args.weight_decay == 5e-4 else args.weight_decay
-        elif args.opt == 'muonv2':
-            # Similar to original Muon but with modified update rule
-            args.lr = 0.05 if args.lr == 0.1 else args.lr
-            args.alpha = 0.1  # momentum blend factor
-            args.gamma = 0.0  # parameter shrink factor
-            args.weight_decay = 0.0
-            args.amp = True
-            args.clip = 0.0
-            if args.sched == 'cosine':
-                args.warmup_epochs = max(args.warmup_epochs, 3)
-        elif args.opt == 'sgdvariant':
-            # Teacher's suggested SGD variant with normalized updates
-            args.lr = 0.05 if args.lr == 0.1 else args.lr
-            args.momentum = 0.9
-            args.weight_decay = 0.0
-            args.nesterov_mom = 0.0
-            args.amp = True
-            args.clip = 0.0
-            if args.sched == 'cosine':
-                args.warmup_epochs = max(args.warmup_epochs, 3)
+    args = parse_args()
 
-    train_loader, test_loader = get_cifar10_dataloaders(
-        args.data_dir, batch_size=args.batch_size, num_workers=args.num_workers)
+    # ----------------- DDP setup -----------------
+    device, ddp, rank, local_rank, world_size, master_process, seed_offset = setup_ddp(args)
+    device_type = "cuda" if device.type == "cuda" else "cpu"
 
-    # Prepare run naming and output locations
-    default_run_name = (
-        f"cifar10_resnet18_{args.opt}_bs{args.batch_size}_lr{args.lr}_clip{args.clip}_"
-        f"{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-    )
-    run_name = args.run_name or default_run_name
-    out_dir = Path(args.out_dir)
-    plot_dir = Path(args.plot_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    plot_dir.mkdir(parents=True, exist_ok=True)
+    # ----------------- Seeding & TF32 -----------------
+    torch.manual_seed(args.seed + seed_offset)
+    np.random.seed(args.seed + seed_offset)
+    if device_type == "cuda":
+        torch.cuda.manual_seed_all(args.seed + seed_offset)
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
-    if not args.trials:
-        metrics_csv_path = out_dir / f"{run_name}.csv"
-        config_json_path = out_dir / f"{run_name}.json"
-
-        # Save run configuration
-        config_to_save = {
-            "dataset": "CIFAR-10",
-            "model": "ResNet18-CIFAR",
-            "optimizer": args.opt,
-            "lr": args.lr,
-            "normpq": args.normpq,
-            "lmo_init": args.lmo_init,
-            "weight_decay": args.weight_decay,
-            "momentum": args.momentum if hasattr(args, 'momentum') else 0.9,
-            "nesterov_mom": bool(args.nesterov_mom) if hasattr(args, 'nesterov_mom') else False,
-            "batch_size": args.batch_size,
-            "clip": args.clip,
-            "device": device,
-            "amp": bool(args.amp),
-            "seed": int(args.seed),
-            "sched": args.sched if hasattr(args, 'sched') else 'none',
-            "warmup_epochs": int(args.warmup_epochs) if hasattr(args, 'warmup_epochs') else 0,
-            "min_lr": float(args.min_lr) if hasattr(args, 'min_lr') else 0.0,
-            "epochs": args.epochs,
-            "num_workers": int(args.num_workers) if hasattr(args, 'num_workers') else 4,
-            "preset": args.preset if hasattr(args, 'preset') else 'none',
-            "data_dir": args.data_dir,
-            "run_name": run_name,
-            "timestamp": datetime.now().isoformat(timespec='seconds')
-        }
-        with open(config_json_path, 'w') as f:
-            json.dump(config_to_save, f, indent=2)
-
-        # Prepare CSV with header
-        csv_fieldnames = [
-            "epoch", "train_loss", "train_acc", "train_time_s", "val_loss", "val_acc",
-            "throughput_img_per_s", "cumulative_time_s", "optimizer", "lr", "lr_epoch", "weight_decay",
-            "batch_size", "clip", "device"
-        ]
-        if not metrics_csv_path.exists():
-            with open(metrics_csv_path, 'w', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=csv_fieldnames)
-                writer.writeheader()
-
-    def append_csv_row(row: dict):
-        with open(metrics_csv_path, 'a', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=csv_fieldnames)
-            writer.writerow(row)
-    if args.model == 'resnet18_cifar':
-        model = resnet18_cifar(
-            num_classes=10, base_width=args.base_width, lmo_p=args.p_exp, lmo_q=args.q_exp, lmo_enable = args.lmo_init).to(device)
-        # use lots of gpu
-        if device == 'cuda' and torch.cuda.device_count() > 1: 
-            model = nn.DataParallel(model)   
-        model = model.to(device)
-    else:
-        raise ValueError(f"Unknown model: {args.model}")
-    
-    def set_fans_resnet_cifar(model: nn.Module):
-        
-        def infer_hw_from_name(module_name: str):
-            if module_name == "conv1" or module_name.startswith("layer1"):
-                return 32, 32
-            if module_name.startswith("layer2"):
-                return 16, 16
-            if module_name.startswith("layer3"):
-                return 8, 8
-            if module_name.startswith("layer4"):
-                return 4, 4
-            return 1, 1
-
-        for name, m in model.named_modules():
-            # ---- Conv2d ----
-            if isinstance(m, nn.Conv2d):
-                H, W = infer_hw_from_name(name)
-                fin  = int(m.in_channels * H * W)
-                fout = int(m.out_channels)
-                
-                m.weight.fan_in_override  = fin
-                m.weight.fan_out_override = fout
-                if m.bias is not None:
-                    m.bias.fan_in_override  = 1
-                    m.bias.fan_out_override = fout
-
-            # ---- Linear ----
-            elif isinstance(m, nn.Linear):
-                fin  = int(m.in_features)
-                fout = int(m.out_features)
-                m.weight.fan_in_override  = fin
-                m.weight.fan_out_override = fout
-                if m.bias is not None:
-                    m.bias.fan_in_override  = 1
-                    m.bias.fan_out_override = fout
-
-    set_fans_resnet_cifar(model)
-
-
-    optimizer = get_optimizer(
-        model, args.opt, lr=args.lr, weight_decay=args.weight_decay, momentum=args.momentum, nesterov_mom=args.nesterov_mom, alpha=args.alpha, gamma=args.gamma, norm_pq=args.normpq)
-    scaler = GradScaler(enabled=(device == 'cuda' and args.amp))
-
-    num_train_images = len(train_loader.dataset)
-    cumulative_time = 0.0
-    history = []  # for plotting
-
-    # Official scheduler: Linear warmup + CosineAnnealingLR
-    scheduler = None
-    if args.sched != 'none':
-        warm = max(0, int(args.warmup_epochs))
-        total = max(1, int(args.epochs))
-        if args.sched == 'cosine':
-            if total <= warm and warm > 0:
-                scheduler = torch.optim.lr_scheduler.LinearLR(
-                    optimizer, start_factor=(1.0 / float(max(1, warm))), total_iters=warm)
-            else:
-                if warm > 0:
-                    warmup = torch.optim.lr_scheduler.LinearLR(
-                        optimizer, start_factor=(1.0 / float(max(1, warm))), total_iters=warm)
-                    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-                        optimizer, T_max=max(1, total - warm), eta_min=args.min_lr)
-                    from torch.optim.lr_scheduler import SequentialLR
-                    scheduler = SequentialLR(optimizer, schedulers=[
-                                            warmup, cosine], milestones=[warm])
-                else:
-                    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                        optimizer, T_max=total, eta_min=args.min_lr)
-        elif args.sched == 'linear':
-            scheduler = two_stage_linear_scheduler(
-                optimizer,
-                total_epochs=total,
-                warmup_epochs=warm,
-                min_lr=args.min_lr, k=3.0
-            )
+    # ----------------- Dtype & autocast ctx -----------------
+    if args.dtype == "auto":
+        if device_type == "cuda" and torch.cuda.is_bf16_supported():
+            dtype = "bfloat16"
         else:
-            raise ValueError(f"Unknown scheduler: {args.sched}")
+            dtype = "float32"
+    else:
+        dtype = args.dtype
 
-    # Ensure first epoch uses warmed LR when applicable
-    if scheduler is not None:
-        scheduler.step()
+    ptdtype = {
+        "float32": torch.float32,
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+    }[dtype]
 
-    for epoch in range(args.epochs):
-        lr_epoch = float(optimizer.param_groups[0]["lr"]) if len(
-            optimizer.param_groups) > 0 else float(args.lr)
-        train_loss, train_acc, train_time = train_one_epoch(
-            model, train_loader, optimizer, device, scaler, max_grad_norm=args.clip, amp_enabled=args.amp)
-        val_loss, val_acc = evaluate(model, test_loader, device)
-        print(f"Epoch {epoch+1}: lr={lr_epoch:.5f} train_loss={train_loss:.4f} acc={train_acc:.2f}% time={train_time:.1f}s | val_loss={val_loss:.4f} acc={val_acc:.2f}%")
-        # >>> 新增：epoch 末尾导出指定层的权重与梯度（使用“最后一个 batch”的梯度）
-        if args.layer_log:
-            snap_path = _save_layer_snapshot(
-                model=model,
-                epoch=epoch + 1,
-                out_dir=out_dir,
-                run_name=run_name,
-                layer_prefix=args.layer_log_prefix,
-                write_stats_csv=args.layer_log_stats
+    if device_type == "cpu" or dtype == "float32":
+        ctx = nullcontext()
+    else:
+        ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+
+    # ----------------- Paths -----------------
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # out_dir (for checkpoints)
+    out_dir = args.out_dir
+    if not os.path.isabs(out_dir):
+        out_dir = os.path.join(script_dir, out_dir)
+
+    # dataset_dir
+    if os.path.isabs(args.dataset_dir):
+        data_dir = args.dataset_dir
+    else:
+        data_dir = os.path.join(script_dir, args.dataset_dir)
+
+    train_bin = os.path.join(data_dir, "train.bin")
+    val_bin = os.path.join(data_dir, "val.bin")
+    if not os.path.isfile(train_bin):
+        raise FileNotFoundError(f"train.bin not found at: {train_bin}")
+    if not os.path.isfile(val_bin):
+        raise FileNotFoundError(f"val.bin not found at: {val_bin}")
+
+    if master_process:
+        os.makedirs(out_dir, exist_ok=True)
+
+    # logs_llm dir for CSV
+    logs_dir = os.path.join(script_dir, "logs_llm")
+    if master_process:
+        os.makedirs(logs_dir, exist_ok=True)
+
+        # ===== 关键修改：使用 "opt_model_name_lr" 作为文件名，并且每次运行都 append =====
+        lr_str = f"{args.lr:g}"  # 例如 0.0006 -> '0.0006', 6e-4 -> '0.0006'
+        csv_filename = f"{args.model_name}_{args.opt}_{lr_str}_p{args.p_exp}_{args.use_fan_scaling}_nmom{args.nesterov_mom}_grad{args.grad_accum_steps}_long.csv"
+        csv_path = os.path.join(logs_dir, csv_filename)
+
+        # 如果文件已存在则追加，否则新建并写表头
+        file_exists = os.path.exists(csv_path)
+        csv_file = open(csv_path, mode="a", newline="")
+        csv_writer = csv.writer(csv_file)
+
+        if (not file_exists) or os.stat(csv_path).st_size == 0:
+            csv_writer.writerow(
+                ["step", "train_loss", "val_loss", "lr", "tokens_seen_per_rank", "step_time_sec"]
             )
+            csv_file.flush()
+    else:
+        csv_file = None
+        csv_writer = None
 
-        cumulative_time += train_time
-        throughput = float(num_train_images) / max(1e-9, float(train_time))
-        row = {
-            "epoch": epoch + 1,
-            "train_loss": float(train_loss),
-            "train_acc": float(train_acc),
-            "train_time_s": float(train_time),
-            "val_loss": float(val_loss),
-            "val_acc": float(val_acc),
-            "throughput_img_per_s": float(throughput),
-            "cumulative_time_s": float(cumulative_time),
-            "optimizer": args.opt,
-            "lr": float(args.lr),
-            "lr_epoch": float(lr_epoch),
-            "weight_decay": float(args.weight_decay),
-            "batch_size": int(args.batch_size),
-            "clip": float(args.clip),
-            "device": device,
-        }
-        if not args.trials:
-            append_csv_row(row)
-        if scheduler is not None:
-            scheduler.step()
-        history.append(row)
+    # ----------------- Data: memmap + get_batch -----------------
+    batch_size = args.batch_size
+    block_size = args.block_size
 
-    # Save plots
-    if _MATPLOTLIB_OK and len(history) > 0 and not args.trials:
-        # Accuracy vs epoch
-        epochs = [r["epoch"] for r in history]
-        train_accs = [r["train_acc"] for r in history]
-        val_accs = [r["val_acc"] for r in history]
-        train_losses = [r["train_loss"] for r in history]
-        plt.figure(figsize=(6, 4))
-        plt.plot(epochs, train_accs, label='Train Top-1')
-        plt.plot(epochs, val_accs, label='Val Top-1')
-        plt.xlabel('Epoch')
-        plt.ylabel('Accuracy (%)')
-        plt.title(run_name)
-        plt.grid(True, linestyle='--', alpha=0.4)
-        plt.legend()
-        plt.tight_layout()
-        acc_plot_path = plot_dir / f"{run_name}_acc.png"
-        plt.savefig(acc_plot_path)
-        plt.close()
+    train_data = np.memmap(train_bin, dtype=np.uint16, mode="r")
+    val_data = np.memmap(val_bin, dtype=np.uint16, mode="r")
 
-        # Accuracy vs cumulative train time
-        times = [r["cumulative_time_s"] for r in history]
-        plt.figure(figsize=(6, 4))
-        plt.plot(times, val_accs, marker='o')
-        plt.xlabel('Cumulative Train Time (s)')
-        plt.ylabel('Val Accuracy (%)')
-        plt.title(f"{run_name} (speed vs accuracy)")
-        plt.grid(True, linestyle='--', alpha=0.4)
-        plt.tight_layout()
-        acc_time_plot_path = plot_dir / f"{run_name}_acc_vs_time.png"
-        plt.savefig(acc_time_plot_path)
-        plt.close()
+    def get_batch(split: str):
+        data = train_data if split == "train" else val_data
+        # sample random start positions
+        if len(data) <= block_size + 1:
+            raise ValueError(
+                f"{split} data too small for block_size={block_size}. Found {len(data)} tokens."
+            )
+        ix = torch.randint(0, len(data) - block_size - 1, (batch_size,))
+        x_list = []
+        y_list = []
+        for i in ix.tolist():
+            x_np = np.array(data[i : i + block_size], dtype=np.int64)
+            y_np = np.array(data[i + 1 : i + 1 + block_size], dtype=np.int64)
+            x_list.append(torch.from_numpy(x_np))
+            y_list.append(torch.from_numpy(y_np))
+        x = torch.stack(x_list)  # (B, T)
+        y = torch.stack(y_list)  # (B, T)
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        return x, y
 
-        # Training loss vs epoch
-        plt.figure(figsize=(6, 4))
-        plt.plot(epochs, train_losses, label='Train Loss', color='#1f77b4')
-        plt.xlabel('Epoch')
-        plt.ylabel('Training Loss')
-        plt.title(f"{run_name} (training loss)")
-        plt.grid(True, linestyle='--', alpha=0.4)
-        plt.legend()
-        plt.tight_layout()
-        loss_plot_path = plot_dir / f"{run_name}_train_loss.png"
-        plt.savefig(loss_plot_path)
-        plt.close()
+    # ----------------- Gradient accumulation steps (global -> local) -----------------
+    global_grad_accum = args.grad_accum_steps
+    if ddp:
+        if global_grad_accum % world_size != 0:
+            raise ValueError(
+                f"grad_accum_steps={global_grad_accum} must be divisible by world_size={world_size} "
+                "to keep effective batch size consistent."
+            )
+        grad_accum_steps = global_grad_accum // world_size
+    else:
+        grad_accum_steps = global_grad_accum
+
+    tokens_per_iter = grad_accum_steps * world_size * batch_size * block_size
+    
+    if master_process:
+        print(f"tokens per iteration will be: {tokens_per_iter:,}")
+
+    # ----------------- Model & optimizer -----------------
+    # model, tokenizer = build_gpt2(...)
+    if args.opt == 'rownorm':
+        
+        model, tokenizer = build_gpt2(device=device, gpt2name = args.model_name, data_parallel=False,use_d=0)
+
+        set_fans_gpt2(model)
+        # init_model_params_rowlmo(model,args.p_exp, args.weight_decay)
+    else:
+        model, tokenizer = build_gpt2(device=device, gpt2name = args.model_name, data_parallel=False,use_d=0)
+
+        set_fans_gpt2(model)
+    print('tied:::::',model.get_output_embeddings().weight is model.get_input_embeddings().weight)
+    # model.to(device)
+
+    # Optionally compile before wrapping with DDP
+    if args.compile:
+        if master_process:
+            print("Compiling the model with torch.compile() (PyTorch 2.0+ required)...")
+        model = torch.compile(model)  # type: ignore
+
+    # Wrap with DDP (if needed)
+    if ddp:
+        model = DDP(model, device_ids=[local_rank])
+
+    # Optimizer via your custom get_optimizer
+    optimizer = get_optimizer(
+        model,
+        args.opt,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        momentum=args.momentum,
+        nesterov_mom=args.nesterov_mom,
+        norm_pq=args.normpq,
+        use_fan_scaling=args.use_fan_scaling,
+    )
+
+    # ----------------- LR scheduler (cosine with warmup, like nanoGPT) -----------------
+    def get_lr(it: int) -> float:
+        # 1) linear warmup for warmup_iters steps
+        if it < args.warmup_iters:
+            return args.lr * it / max(1, args.warmup_iters)
+        # 2) if it > lr_decay_iters, return min learning rate
+        if it > args.lr_decay_iters:
+            return args.min_lr
+        # 3) in between, use cosine decay from lr to min_lr
+        decay_ratio = (it - args.warmup_iters) / max(1, args.lr_decay_iters - args.warmup_iters)
+        decay_ratio = max(0.0, min(1.0, decay_ratio))
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))  # ranges 1..0
+        return args.min_lr + coeff * (args.lr - args.min_lr)
+
+    # ----------------- Evaluation function (nanoGPT-style estimate_loss) -----------------
+    @torch.no_grad()
+    def estimate_loss():
+        model.eval()
+        out = {}
+        for split in ("train", "val"):
+            losses = []
+            for _ in range(args.eval_iters):
+                x, y = get_batch(split)
+                with ctx:
+                    outputs = model(input_ids=x)
+                    logits = getattr(outputs, "logits", None)
+                    if logits is None:
+                        # fall back for plain torch Module returning logits directly
+                        if isinstance(outputs, (tuple, list)):
+                            logits = outputs[0]
+                        else:
+                            logits = outputs
+                    loss = F.cross_entropy(
+                        logits.view(-1, logits.size(-1)),
+                        y.view(-1),
+                    )
+                losses.append(loss.item())
+            out[split] = float(np.mean(losses))
+        model.train()
+        return out
+
+    # ----------------- Training loop -----------------
+    iter_num = 0
+    best_val_loss = float("inf")
+    tokens_seen = 0
+    t0 = time.time()
+
+    try:
+        while iter_num < args.max_iters:
+            # Determine learning rate for this iteration (cosine decay with warmup)
+            lr = get_lr(iter_num)
+            for pg in optimizer.param_groups:
+                pg["lr"] = lr
+
+            # Periodic evaluation + checkpoint + CSV logging (master only)
+            if master_process and (iter_num % args.eval_interval == 0 or iter_num == args.max_iters - 1):
+                losses = estimate_loss()
+                train_loss = losses["train"]
+                val_loss = losses["val"]
+                print(
+                    f"[rank {rank}] step {iter_num}: "
+                    f"train loss {train_loss:.4f}, val loss {val_loss:.4f}, lr {lr:.3e}"
+                )
+                if csv_writer is not None:
+                    step_time = time.time() - t0
+                    csv_writer.writerow(
+                        [
+                            iter_num,
+                            f"{train_loss:.6f}",
+                            f"{val_loss:.6f}",
+                            f"{lr:.6e}",
+                            tokens_seen,
+                            f"{step_time:.6f}",
+                        ]
+                    )
+                    csv_file.flush()
+
+                # Save checkpoint if val improves (or always if you prefer)
+                # if val_loss < best_val_loss:
+                #     best_val_loss = val_loss
+                #     raw_model = model.module if ddp else model
+                #     ckpt = {
+                #         "model_state_dict": raw_model.state_dict(),
+                #         "optimizer_state_dict": optimizer.state_dict(),
+                #         "iter_num": iter_num,
+                #         "best_val_loss": best_val_loss,
+                #         "config": vars(args),
+                #     }
+                #     ckpt_path = os.path.join(out_dir, "ckpt.pt")
+                #     print(f"[rank {rank}] saving checkpoint to {ckpt_path}")
+                #     torch.save(ckpt, ckpt_path)
+
+            # Sync all ranks here before continuing (optional but nice)
+            # if ddp:
+            #     dist.barrier()
+
+            # Forward/backward with gradient accumulation (nanoGPT-style)
+            model.train()
+            optimizer.zero_grad(set_to_none=True)
+
+            for micro_step in range(grad_accum_steps):
+                x, y = get_batch("train")
+                tokens_seen += x.numel()
+
+                if ddp and micro_step < grad_accum_steps - 1:
+                    grad_ctx = model.no_sync()
+                else:
+                    grad_ctx = nullcontext()
+
+                with ctx, grad_ctx:
+                    outputs = model(input_ids=x)
+                    logits = getattr(outputs, "logits", None)
+                    if logits is None:
+                        if isinstance(outputs, (tuple, list)):
+                            logits = outputs[0]
+                        else:
+                            logits = outputs
+                    loss = F.cross_entropy(
+                        logits.view(-1, logits.size(-1)),
+                        y.view(-1),
+                    )
+                    # average loss over micro-steps
+                    loss = loss / grad_accum_steps
+
+                loss.backward()
+
+            # Gradient clipping
+            if args.grad_clip is not None and args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
+            # Timing & logging
+            t1 = time.time()
+            dt = t1 - t0
+            t0 = t1
+
+            if master_process and (iter_num % args.log_every == 0):
+                loss_val = float(loss.item())
+                print(
+                    f"[rank {rank}] iter {iter_num}: loss {loss_val:.4f}, "
+                    f"lr {lr:.3e}, time {dt * 1000:.2f}ms"
+                )
+
+            iter_num += 1
+
+    finally:
+        if master_process and csv_file is not None:
+            csv_file.close()
+        if ddp and dist.is_initialized():
+            dist.destroy_process_group()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

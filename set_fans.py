@@ -1,5 +1,5 @@
 import torch.nn as nn
-
+import torch
 def set_fans_gpt2(model: nn.Module):
 
     # 尝试拿到 HF 的 Conv1D 类型（GPT-2 用它实现 Linear）
@@ -25,7 +25,8 @@ def set_fans_gpt2(model: nn.Module):
             tied_lm_head_with_wte = (lm_head.weight is wte.weight)
     except Exception:
         lm_head = None
-
+    if tied_lm_head_with_wte:
+        model.lm_head.weight = torch.nn.Parameter(model.lm_head.weight.detach().clone())
     # 一个小工具：给 param 写入 fan 属性
     def _set_param_fans(param, fin, fout):
         if hasattr(param, "data"):
@@ -38,14 +39,17 @@ def set_fans_gpt2(model: nn.Module):
     for mod_name, m in model.named_modules():
         
         if isinstance(m, nn.Linear):
+            m.weight.is_ebd = 0
+            
             
             # HFConv1D 的 weight 形状是 (in_features, out_features)
             # nn.Linear 的 weight 形状是 (out_features, in_features)
             if hasattr(m, "weight") and m.weight is not None and m.weight.dim() == 2:
                 
                 out_features, in_features = m.weight.shape
-                
+                m.weight.is_head = 1
                 _set_param_fans(m.weight, fin=in_features, fout=out_features)
+                # print('linear',m.weight.fan_in_override,m.weight.fan_out_override)
             # bias（若存在）
             if hasattr(m, "bias") and m.bias is not None and m.bias.dim() == 1:
                 out_features = m.bias.shape[0]
@@ -68,6 +72,7 @@ def set_fans_gpt2(model: nn.Module):
 
         # ---- Embedding（wte / wpe）----
         elif isinstance(m, nn.Embedding):
+            # print(m.weight.shape)
             m.weight.is_ebd = 1
             num_embeddings = m.num_embeddings
             embed_dim = m.embedding_dim
@@ -78,9 +83,10 @@ def set_fans_gpt2(model: nn.Module):
                 fin = m.weight.shape[0]
                 fout = m.weight.shape[1]
                 _set_param_fans(m.weight, fin=fin, fout=fout)
+                m.weight.is_ebd = 1
                 
                 
-
+                # print('emb',m.weight.fan_in_override,m.weight.fan_out_override)
         else:
             
             if mod_name.endswith(".ln_1") or mod_name.endswith(".ln_2") or mod_name.endswith(".ln_f"):
@@ -88,15 +94,15 @@ def set_fans_gpt2(model: nn.Module):
                 
             # 其他模块（如 LayerNorm）通常只有 1D 权重，无需设置
             pass
-
+    
     # 兜底：如果模型里有 lm_head 且其 weight 未在上面被处理成 (embed_dim, vocab) 的 fan，
     # 再单独设置一次（防止因为模块判断路径漏掉）
-    if lm_head is not None and hasattr(lm_head, "weight") and lm_head.weight is not None:
+    # if lm_head is not None and hasattr(lm_head, "weight") and lm_head.weight is not None:
         
-        W = lm_head.weight
-        if W.dim() == 2:
-            out_features, in_features = W.shape  # (vocab_size, embed_dim)
-            _set_param_fans(W, fin=in_features, fout=out_features)
-        # lm_head 通常无 bias；若有则一并处理
-        if hasattr(lm_head, "bias") and lm_head.bias is not None and lm_head.bias.dim() == 1:
-            _set_param_fans(lm_head.bias, fin=1, fout=lm_head.bias.shape[0])
+    #     W = lm_head.weight
+    #     if W.dim() == 2:
+    #         out_features, in_features = W.shape  # (vocab_size, embed_dim)
+    #         _set_param_fans(W, fin=in_features, fout=out_features)
+    #     # lm_head 通常无 bias；若有则一并处理
+    #     if hasattr(lm_head, "bias") and lm_head.bias is not None and lm_head.bias.dim() == 1:
+    #         _set_param_fans(lm_head.bias, fin=1, fout=lm_head.bias.shape[0])
