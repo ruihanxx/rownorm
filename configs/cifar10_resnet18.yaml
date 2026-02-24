@@ -1,8 +1,0 @@
-data_dir: ~/.cache/cifar
-epochs: 1
-batch_size: 128
-lr: 0.1
-weight_decay: 0.0005
-opt: rownorm # choices: sgd, rownorm, signsgd, muon
-
-
