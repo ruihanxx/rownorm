@@ -1,0 +1,7 @@
+{"time":"2026-02-14T20:07:59.164836564-06:00","level":"INFO","msg":"main: starting server","port-filename":"/projects/p33066/tmp/tmp8b9y2hvz/port-4117591.txt","pid":4117591,"log-level":0,"disable-analytics":false,"shutdown-on-parent-exit":false,"enable-dcgm-profiling":false}
+{"time":"2026-02-14T20:07:59.166615741-06:00","level":"INFO","msg":"server: will exit if parent process dies","ppid":4117591}
+{"time":"2026-02-14T20:07:59.166607097-06:00","level":"INFO","msg":"server: accepting connections","addr":{"Name":"/projects/p33066/tmp/wandb-4117591-4118050-2434349769/socket","Net":"unix"}}
+{"time":"2026-02-14T20:07:59.235548332-06:00","level":"INFO","msg":"connection: ManageConnectionData: new connection created","id":"1(@)"}
+{"time":"2026-02-14T20:07:59.277786259-06:00","level":"INFO","msg":"handleInformInit: received","streamId":"qk1400n1","id":"1(@)"}
+{"time":"2026-02-14T20:07:59.55217666-06:00","level":"INFO","msg":"handleInformInit: stream started","streamId":"qk1400n1","id":"1(@)"}
+{"time":"2026-02-14T20:10:04.594851121-06:00","level":"INFO","msg":"server: parent process exited, terminating service process"}
