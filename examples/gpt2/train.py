@@ -36,7 +36,7 @@ except Exception:
     pass
 
 # Import model module
-from models.gpt2_model_old import load_tokenizer, build_model_from_name, build_gpt2, init_model_params_rowlmo, init_model_params_rowlmo_rowmix
+from models.gpt2_model import load_tokenizer, build_model_from_name, build_gpt2, init_model_params_rowlmo, init_model_params_rowlmo_rowmix
 from set_fans import set_fans_gpt2
 
 def build_weight_decay_param_groups(model: nn.Module, weight_decay: float):
@@ -50,19 +50,15 @@ def build_weight_decay_param_groups(model: nn.Module, weight_decay: float):
         {"params": no_decay_params, "weight_decay": 0.0},
     ]
 
-def get_optimizer(model, name: str, lr: float, weight_decay: float, momentum: float, nesterov_mom: float, norm_pq=(1,torch.inf), use_fan_scaling=True):
+def get_optimizer(model, name: str, lr: float, weight_decay: float, momentum: float, nesterov_mom: float, norm_pq=(1,torch.inf), use_fan_scaling=True, base_factor=20):
     import torch.optim as optim
     param_groups = build_weight_decay_param_groups(model, weight_decay)
     name = name.lower()
     if name == 'rowmix':
         return RowmixSGD(param_groups, lr=lr, momentum=momentum, weight_decay=weight_decay, nesterov_mom=nesterov_mom, max_grad_norm=1)
-    if name == "rownorm":
-        from optim.rownorm import RowNormSGD
-        return RowNormSGD(param_groups, lr=lr, momentum=momentum, weight_decay=weight_decay, nesterov_mom=nesterov_mom, max_grad_norm=1.0, p_exp=norm_pq[0], q_exp = norm_pq[1], use_fan_scaling = use_fan_scaling)
-    if name == "rownormbase":
-        from optim.rownorm_base import RowNormSGD
-        return RowNormSGD(param_groups, lr=lr, momentum=momentum, weight_decay=weight_decay, nesterov_mom=nesterov_mom, max_grad_norm=1.0, p_exp=norm_pq[0], q_exp = norm_pq[1], use_fan_scaling = use_fan_scaling)
-    
+    if name == "moga":
+        from optim.moga import MOGASGD
+        return MOGASGD(param_groups, lr=lr, momentum=momentum, weight_decay=weight_decay, nesterov_mom=nesterov_mom, max_grad_norm=1.0, p_exp=norm_pq[0], q_exp = norm_pq[1], use_fan_scaling = use_fan_scaling, base_factor=base_factor)
     if name == "signsgd":
         return SignSGD(param_groups, lr=lr, momentum=momentum, weight_decay=weight_decay, p_exp = 1, use_fan_scaling = use_fan_scaling)
     if name == "adamw":
@@ -119,6 +115,8 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=6e-4,
                         help="Peak learning rate.")
     parser.add_argument("--min_lr", type=float, default=6e-5,
+                        help="Minimum learning rate after cosine decay.")
+    parser.add_argument("--base_factor", type=float, default=20,
                         help="Minimum learning rate after cosine decay.")
     parser.add_argument("--warmup_iters", type=int, default=2000,
                         help="Iterations for linear LR warmup.")
@@ -330,7 +328,7 @@ def main():
 
     # ----------------- Model & optimizer -----------------
     # model, tokenizer = build_gpt2(...)
-    if args.opt == 'rownorm':
+    if args.opt == 'moga':
         
         model, tokenizer = build_gpt2(device=device, gpt2name = args.model_name, data_parallel=False,use_d=0)
 
@@ -378,6 +376,7 @@ def main():
             nesterov_mom=args.nesterov_mom,
             norm_pq=args.normpq,
             use_fan_scaling=args.use_fan_scaling,
+            base_factor=args.base_factor,
         )
 
     # ----------------- LR scheduler (cosine with warmup, like nanoGPT) -----------------
@@ -457,24 +456,7 @@ def main():
                     )
                     csv_file.flush()
 
-                # Save checkpoint if val improves (or always if you prefer)
-                # if val_loss < best_val_loss:
-                #     best_val_loss = val_loss
-                #     raw_model = model.module if ddp else model
-                #     ckpt = {
-                #         "model_state_dict": raw_model.state_dict(),
-                #         "optimizer_state_dict": optimizer.state_dict(),
-                #         "iter_num": iter_num,
-                #         "best_val_loss": best_val_loss,
-                #         "config": vars(args),
-                #     }
-                #     ckpt_path = os.path.join(out_dir, "ckpt.pt")
-                #     print(f"[rank {rank}] saving checkpoint to {ckpt_path}")
-                #     torch.save(ckpt, ckpt_path)
-
-            # Sync all ranks here before continuing (optional but nice)
-            # if ddp:
-            #     dist.barrier()
+            
 
             # Forward/backward with gradient accumulation (nanoGPT-style)
             model.train()

@@ -339,10 +339,9 @@ def load_tokenizer(model_name: str):
     """
     Load a GPT-2 tokenizer and ensure pad_token exists.
     """
-    if model_name == "small":
-        tok = GPT2TokenizerFast.from_pretrained("./gpt2")
-    else:
-        tok = GPT2TokenizerFast.from_pretrained("./gpt2_l")
+    
+    tok = GPT2TokenizerFast.from_pretrained("gpt2")
+
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     return tok

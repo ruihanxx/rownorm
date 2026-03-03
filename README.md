@@ -43,11 +43,11 @@ python prepare_openwebtext.py
 
 ### Step 3 — Run the training script
 
-Use the provided launcher script to start the large-token experiment with RowNorm (configured for 4 GPUs):
+Use the provided launcher script to start the large-token experiment with MOGA (configured for 4 GPUs):
 
 ```bash
-# run the 130M LLaMA large-token experiment with RowNorm (uses 4 GPUs)
-bash scripts/large_token/rownorm_small.sh
+# run the 130M GPT-2 large-token experiment with MOGA (uses 4 GPUs)
+bash scripts/large_token/moga_small.sh
 ```
 
 After training starts, you can monitor results via the log directory:
@@ -81,8 +81,8 @@ bash download_c4.sh
 Launch the large-token experiment (configured for 4 GPUs):
 
 ```bash
-# run the 130M LLaMA large-token experiment with RowNorm (uses 4 GPUs)
-bash scripts/large_token/llama_130m_rownorm.sh
+# run the 130M LLaMA large-token experiment with MOGA (uses 4 GPUs)
+bash scripts/large_token/llama_130m_moga.sh
 ```
 
 Training logs are written here:

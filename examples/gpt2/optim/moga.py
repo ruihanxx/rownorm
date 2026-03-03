@@ -3,8 +3,7 @@ from typing import Iterable, Optional
 import torch
 
 
-
-class RowNormSGD(torch.optim.Optimizer):
+class MOGASGD(torch.optim.Optimizer):
     """
     Row normalization is performed as:
         g[i, :] <- g[i, :] / (||g[i, :]||_2 + eps)
@@ -40,10 +39,20 @@ class RowNormSGD(torch.optim.Optimizer):
         if p_exp > q_exp:
             raise ValueError("q must be > p")
 
-        defaults = dict(lr=lr, momentum=momentum,
-                        weight_decay=weight_decay, nesterov_mom=nesterov_mom,
-                        eps=eps, max_grad_norm=max_grad_norm, p_exp=p_exp, q_exp=q_exp, use_fan_scaling=use_fan_scaling, base_factor=base_factor,)
+        defaults = dict(
+            lr=lr,
+            momentum=momentum,
+            weight_decay=weight_decay,
+            nesterov_mom=nesterov_mom,
+            eps=eps,
+            max_grad_norm=max_grad_norm,
+            p_exp=p_exp,
+            q_exp=q_exp,
+            use_fan_scaling=use_fan_scaling,
+            base_factor=base_factor,
+        )
         super().__init__(params, defaults)
+
     @staticmethod
     def _fans_by_rule(t: torch.Tensor) -> tuple[int, int]:
         """Return (fan_in, fan_out) for a parameter tensor.
@@ -75,8 +84,9 @@ class RowNormSGD(torch.optim.Optimizer):
             f"Tensor with ndim={t.ndim} is not supported for fan scaling. "
             "Use 2D/4D parameters or disable fan scaling."
         )
+
     @staticmethod
-    def _rownorm_inplace(gggrad: torch.Tensor, eps: float, p_exp: float = 1.0, q_exp: float = torch.inf) -> torch.Tensor:
+    def _moga_inplace(gggrad: torch.Tensor, eps: float, p_exp: float = 1.0, q_exp: float = torch.inf) -> torch.Tensor:
         """Row-normalize gradients for 2D or 4D tensors.
 
         This implements a stabilized normalization that is compatible with general p/q exponents:
@@ -133,7 +143,7 @@ class RowNormSGD(torch.optim.Optimizer):
             return gggrad
 
         return gggrad
-        
+
     @torch.no_grad()
     def step(self, closure: Optional[callable] = None):
         loss = None
@@ -151,8 +161,6 @@ class RowNormSGD(torch.optim.Optimizer):
             p_exp: float = group["p_exp"]
             q_exp: float = group["q_exp"]
             use_fan_scaling: bool = group["use_fan_scaling"]
-
-
             base_factor: float = group["base_factor"]
 
             gradients = []
@@ -177,10 +185,10 @@ class RowNormSGD(torch.optim.Optimizer):
                 if momentum != 0 and True:
                     buf: torch.Tensor = state["momentum_buffer"]
                     if nesterov_mom > 0:
-                        d_p = grad.mul(1-nesterov_mom).add(buf, alpha=nesterov_mom)
-                        buf.mul_(momentum).add_(grad, alpha=1-momentum)
+                        d_p = grad.mul(1 - nesterov_mom).add(buf, alpha=nesterov_mom)
+                        buf.mul_(momentum).add_(grad, alpha=1 - momentum)
                     else:
-                        buf.mul_(momentum).add_(grad, alpha=1-momentum)
+                        buf.mul_(momentum).add_(grad, alpha=1 - momentum)
                         d_p = buf
                 else:
                     d_p = grad
@@ -193,18 +201,17 @@ class RowNormSGD(torch.optim.Optimizer):
                         if p_is_conv:
                             p_is_qkv = getattr(p, "is_qkv", 0)
                             if not p_is_qkv:
-
                                 fin, fout = self._fans_by_rule(p)
-                                temp = self._rownorm_inplace(d_p.T, eps, p_exp, q_exp).T
+                                temp = self._moga_inplace(d_p.T, eps, p_exp, q_exp).T
                                 update = temp.detach().clone()
                                 if use_fan_scaling:
                                     update.mul_(1 / (float(fin) ** (1.0 / p_exp))).mul_(base_factor)
                             elif (not p_is_ebd) and p_is_qkv:
                                 fin, fout = self._fans_by_rule(p)
                                 gq, gk, gv = torch.chunk(d_p, 3, dim=1)
-                                gq2 = self._rownorm_inplace(gq.T, eps, p_exp, q_exp).T
-                                gk2 = self._rownorm_inplace(gk.T, eps, p_exp, q_exp).T
-                                gv2 = self._rownorm_inplace(gv.T, eps, p_exp, q_exp).T
+                                gq2 = self._moga_inplace(gq.T, eps, p_exp, q_exp).T
+                                gk2 = self._moga_inplace(gk.T, eps, p_exp, q_exp).T
+                                gv2 = self._moga_inplace(gv.T, eps, p_exp, q_exp).T
                                 temp = torch.cat([gq2, gk2, gv2], dim=1)
                                 update = temp.detach().clone()
                                 if use_fan_scaling:
@@ -215,20 +222,19 @@ class RowNormSGD(torch.optim.Optimizer):
                             update = temp.detach().clone()
                         else:
                             fin, fout = self._fans_by_rule(p)
-                            temp = self._rownorm_inplace(d_p, eps, p_exp, q_exp)
+                            temp = self._moga_inplace(d_p, eps, p_exp, q_exp)
                             update = temp.detach().clone()
                 elif d_p.ndim == 1:
                     d_p = torch.sign(d_p)
                     update = d_p.detach().clone()
-                # Decoupled weight decay
-                if weight_decay != 0 :
 
+                # Decoupled weight decay
+                if weight_decay != 0:
                     if p.ndim != 1:
                         p.mul_(1.0 - lr * weight_decay)
 
                 alpha = -lr
-
-
                 p.add_(update, alpha=alpha)
 
         return loss
+

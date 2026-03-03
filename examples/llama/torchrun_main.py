@@ -32,7 +32,7 @@ from pretraining.dataloader import PreprocessedIterableDataset
 from pretraining.modeling_llama import LlamaForCausalLM
 
 import bitsandbytes as bnb
-from conda_torch import Muon, RowNormSGD
+from conda_torch import Muon, MOGASGD
 from set_fans import set_fans_llama
 
 def parse_args(args):
@@ -352,9 +352,9 @@ def main(args):
     elif args.optimizer.lower() == "adamw":
         optimizer = transformers.optimization.AdamW(trainable_params, lr=args.lr, betas=args.betas, weight_decay=args.weight_decay)
 
-    elif args.optimizer.lower() == "rownorm":
+    elif args.optimizer.lower() == "moga":
 
-        optimizer = RowNormSGD(trainable_params, lr=args.lr, momentum=args.betas[0], weight_decay=args.weight_decay, nesterov_mom=0.0, max_grad_norm=1.0, p_exp=2, q_exp = math.inf, use_fan_scaling = 1)
+        optimizer = MOGASGD(trainable_params, lr=args.lr, momentum=args.betas[0], weight_decay=args.weight_decay, nesterov_mom=0.0, max_grad_norm=1.0, p_exp=2, q_exp = math.inf, use_fan_scaling = 1)
     elif args.optimizer.lower() == "conda":
         optimizer = Conda(param_groups, lr=args.lr, betas=args.betas, weight_decay=args.weight_decay)
 

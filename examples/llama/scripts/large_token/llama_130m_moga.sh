@@ -1,0 +1,2 @@
+torchrun --standalone --nproc_per_node 4 torchrun_main.py --model_config configs/llama_130m.json --lr 0.008 --batch_size 128 --total_batch_size 512 --num_training_steps 400000 --warmup_steps 10000 --weight_decay 0 --betas 0.95 --dtype bfloat16 --eval_every 2000 --save_every 400000 --save_dir checkpoints/llama_130m_moga_lr_0.008_wd_0_betas_0.95_factor_20_long  --optimizer moga --wandb_name llama_130m_moga_lr_0.008_wd_0_betas_0.95_factor_20_long 
+
