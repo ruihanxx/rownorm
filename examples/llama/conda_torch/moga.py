@@ -146,7 +146,7 @@ class MOGASGD(torch.optim.Optimizer):
             for p in group["params"]:
                 if p.grad is None:
                     continue
-
+                
                 gggggg = p.grad
                 grad = gggggg.detach().clone().to(gggggg.dtype).contiguous()
 
