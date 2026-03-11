@@ -3,7 +3,7 @@ torchrun --standalone --nproc_per_node=4 train.py \
   --batch_size 64 --block_size 512 --grad_accum_steps 16 \
   --opt moonlight \
   --momentum 0.95 --nesterov_mom 0 \
-  --lr 1e-2 --min_lr 1e-3 \
+  --lr 4e-3 --min_lr 4e-4 \
   --weight_decay 0.1 --use_fan_scaling 0 \
   --warmup_iters 600 --lr_decay_iters 6000 --max_iters 6000 \
   --p_exp 2 \
